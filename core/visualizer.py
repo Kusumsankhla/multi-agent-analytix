@@ -830,3 +830,4 @@ class VisualizerEngine:
             charts["radar"] = radar_fig
 
         return charts
+

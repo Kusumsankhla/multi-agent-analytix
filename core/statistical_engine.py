@@ -55,98 +55,99 @@ class StatisticalEngine:
 
     @classmethod
     def analyze_dataset_statistics(
-        cls, 
-        columns: List[str], 
-        rows: List[List[Any]], 
+        cls,
+        columns: List[str],
+        rows: List[List[Any]],
         question: str
     ) -> Dict[str, Any]:
         """
-        Generates automated statistical hypothesis testing, confidence intervals,
-        and anomaly detection for the executed query result.
+        Computes descriptive statistics, standardized Z-scores (z = (x - μ) / σ),
+        95% confidence intervals for the mean, and Tukey IQR outlier detection.
+        Does not divide single-value deviations by standard error or claim single observations
+        are 'statistically significant causal drivers'.
         """
         if not rows or len(columns) < 2:
-            return {
-                "has_stats": False,
-                "summary": "Insufficient numeric dimensions for statistical tests."
-            }
+            return {"has_stats": False, "summary": "Insufficient result columns for descriptive statistics."}
 
-        # Find first numeric metric column
-        metric_col_idx = None
-        for idx in range(1, len(columns)):
-            if any(isinstance(r[idx], (int, float)) for r in rows):
-                metric_col_idx = idx
-                break
+        metric_idx = next(
+            (i for i in range(1, len(columns))
+             if any(isinstance(r[i], (int, float)) and not isinstance(r[i], bool) for r in rows if i < len(r))),
+            None
+        )
+        if metric_idx is None:
+            return {"has_stats": False, "summary": "No numeric metric found in the query result."}
 
-        if metric_col_idx is None:
-            return {
-                "has_stats": False,
-                "summary": "No numeric metric found for statistical tests."
-            }
+        dim_col, metric_col = columns[0], columns[metric_idx]
+        pairs = [(str(r[0]), float(r[metric_idx])) for r in rows
+                 if len(r) > metric_idx and isinstance(r[metric_idx], (int, float))
+                 and not isinstance(r[metric_idx], bool) and math.isfinite(float(r[metric_idx]))]
+        if len(pairs) < 2:
+            return {"has_stats": False, "summary": "At least two numeric result rows are required."}
 
-        dim_col = columns[0]
-        metric_col = columns[metric_col_idx]
-        
-        # Extract numeric series
-        series = []
-        labels = []
-        for r in rows:
-            val = r[metric_col_idx]
-            if isinstance(val, (int, float)):
-                series.append(float(val))
-                labels.append(str(r[0]))
+        # Sort pairs by metric value descending for inspection
+        pairs_sorted_val = sorted(pairs, key=lambda p: p[1], reverse=True)
+        top_entity, top_val = pairs_sorted_val[0]
 
-        if len(series) < 2:
-            return {
-                "has_stats": False,
-                "summary": "Need at least 2 distinct groups for statistical comparison."
-            }
-
-        n = len(series)
-        mean_val = sum(series) / n
-        variance = sum((x - mean_val) ** 2 for x in series) / (n - 1) if n > 1 else 0.0
+        values = [p[1] for p in pairs]
+        n = len(values)
+        mean_val = sum(values) / n
+        variance = sum((x - mean_val) ** 2 for x in values) / (n - 1) if n > 1 else 0.0
         std_val = math.sqrt(variance)
-        sorted_s = sorted(series)
-        median_val = sorted_s[n // 2]
+        sorted_vals = sorted(values)
+        median_val = (sorted_vals[n // 2] if n % 2 else (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2)
 
-        # Interquartile Range (IQR) & Z-score Outlier Detection
-        q1 = sorted_s[int(n * 0.25)]
-        q3 = sorted_s[int(n * 0.75)]
+        def percentile(sorted_data, p):
+            pos = (len(sorted_data) - 1) * p
+            lo = int(math.floor(pos))
+            hi = int(math.ceil(pos))
+            if lo == hi:
+                return sorted_data[lo]
+            return sorted_data[lo] * (hi - pos) + sorted_data[hi] * (pos - lo)
+
+        q1, q3 = percentile(sorted_vals, .25), percentile(sorted_vals, .75)
         iqr = q3 - q1
-        lower_bound = q1 - 1.5 * iqr
-        upper_bound = q3 + 1.5 * iqr
+        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
 
+        # Calculate standard Z-score for single values: z = (x - μ) / σ
+        top_z = (top_val - mean_val) / std_val if std_val > 0 else 0.0
+
+        # Detect outliers via Z-score (|z| >= 1.8) and Tukey IQR rule
         anomalies = []
-        for label, val in zip(labels, series):
+        for label, val in pairs:
             z = (val - mean_val) / std_val if std_val > 0 else 0.0
-            if abs(z) >= 1.8 or val > upper_bound or val < lower_bound:
+            reasons = []
+            if abs(z) >= 1.8 and (val < lower or val > upper):
+                reasons.append("Both Z-Score (|z| ≥ 1.8) and Tukey IQR Bound")
+            elif abs(z) >= 1.8:
+                reasons.append("Standardized Z-Score (|z| ≥ 1.8)")
+            elif val < lower or val > upper:
+                bound_desc = f"above upper bound {round(upper, 2)}" if val > upper else f"below lower bound {round(lower, 2)}"
+                reasons.append(f"Tukey IQR Rule ({bound_desc}; z = {round(z, 2)} is within normal Z-spread < 1.8)")
+
+            if reasons:
                 anomalies.append({
                     "entity": label,
                     "value": round(val, 2),
                     "z_score": round(z, 2),
-                    "anomaly_type": "HIGH_OUTLIER" if z > 0 else "LOW_OUTLIER",
-                    "severity": "CRITICAL" if abs(z) >= 2.5 else "MODERATE"
+                    "anomaly_type": "HIGH_OUTLIER" if val > mean_val else "LOW_OUTLIER",
+                    "outlier_rule": " + ".join(reasons),
+                    "severity": "HIGH" if abs(z) >= 2.5 else "MODERATE"
                 })
 
-        # 95% Confidence Interval for the mean
-        margin_error = 1.96 * (std_val / math.sqrt(n)) if n > 0 else 0.0
-        ci_lower = round(mean_val - margin_error, 2)
-        ci_upper = round(mean_val + margin_error, 2)
+        # 95% Confidence Interval for the Group Mean: μ ± 1.96 * (σ / sqrt(n))
+        se_mean = (std_val / math.sqrt(n)) if n > 0 else 0.0
+        ci_lower = round(mean_val - 1.96 * se_mean, 2)
+        ci_upper = round(mean_val + 1.96 * se_mean, 2)
 
-        # Formal Hypothesis Testing Formulation
-        top_entity = labels[0]
-        top_val = series[0]
-        second_entity = labels[1]
-        second_val = series[1]
+        interpretation = (
+            f"Descriptive frequency distribution across {n} '{dim_col}' segments for metric '{metric_col}'. "
+            f"Peak group is '{top_entity}' (Value: {round(top_val, 2)}, z = {round(top_z, 2)}). "
+            f"Note: In descriptive frequency distributions, a high count represents the sample mode/peak frequency, "
+            f"not an inferential causal driver."
+        )
 
-        # Test if top entity is statistically distinct from the group mean
-        z_test_stat = (top_val - mean_val) / (std_val / math.sqrt(n)) if std_val > 0 else 0.0
-        p_val_top = 2.0 * (1.0 - cls.norm_cdf(abs(z_test_stat)))
-        p_val_top = max(0.0001, min(1.0, p_val_top))
-
-        h0 = f"Null Hypothesis (H0): There is no statistically significant variation in {metric_col} across {dim_col} segments."
-        h1 = f"Alternative Hypothesis (H1): '{top_entity}' exhibits a statistically significant deviation in {metric_col} compared to benchmark average."
-        
-        is_stat_sig = p_val_top < 0.05
+        h0 = f"Baseline: Groups follow empirical sample distribution (Mean = {round(mean_val, 2)}, Std Dev = {round(std_val, 2)})."
+        h1 = f"Dispersion: Segments deviate from sample mean by their standard Z-scores z = (x - Mean) / StdDev."
 
         return {
             "has_stats": True,
@@ -156,15 +157,29 @@ class StatisticalEngine:
             "mean": round(mean_val, 2),
             "median": round(median_val, 2),
             "std_dev": round(std_val, 2),
+            "iqr": round(iqr, 2),
+            "top_entity": top_entity,
+            "top_value": round(top_val, 2),
+            "top_z": round(top_z, 2),
             "confidence_interval_95": (ci_lower, ci_upper),
+            "confidence_interval_95_mean": (ci_lower, ci_upper),
             "anomalies": anomalies,
+            "interpretation": interpretation,
             "hypothesis_test": {
                 "h0": h0,
                 "h1": h1,
-                "test_name": "One-Sample Z-Test against Population Mean",
-                "test_statistic": round(z_test_stat, 3),
-                "p_value": round(p_val_top, 4),
-                "significant": is_stat_sig,
-                "conclusion": f"Reject H0 in favor of H1 (p = {round(p_val_top, 4)} < 0.05). '{top_entity}' is a statistically significant driver." if is_stat_sig else f"Fail to reject H0 (p = {round(p_val_top, 4)} >= 0.05). Differences are within expected variance."
+                "test_name": "Standardized Group Dispersion & Outlier Analysis",
+                "test_statistic": round(top_z, 2),
+                "peak_entity": top_entity,
+                "peak_value": round(top_val, 2),
+                "peak_z_score": round(top_z, 2),
+                "p_value": "N/A (Descriptive)",
+                "significant": False,
+                "conclusion": (
+                    f"Descriptive distribution analysis: '{top_entity}' is the peak observation "
+                    f"({round(top_val, 2)}, z = {round(top_z, 2)} standard deviations from the mean). "
+                    f"No causal driver claim is made from grouped descriptive data."
+                )
             }
         }
+

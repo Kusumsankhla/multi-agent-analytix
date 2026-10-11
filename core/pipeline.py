@@ -5,7 +5,7 @@ from typing import Dict, Any, Tuple, Optional, Callable
 
 from core.llm_client import LLMClient
 from core.sandbox import SQLSandbox
-from core.verification_engine import DeterministicFactChecker
+from core.verification_engine import DeterministicFactChecker, QueryIntentValidator
 from core.proof_receipt import CryptographicProofGenerator
 from core.statistical_engine import StatisticalEngine
 from core.visualizer import VisualizerEngine
@@ -137,6 +137,9 @@ class VerifiableAnalysisPipeline:
         # 3. Stage 2: Coding
         notify("CODING", "Generating dialect-safe SQL query...")
         generated_sql = self.coder.generate_sql(question, plan_text, schema_info, table_name)
+        if generated_sql.startswith("UNSUPPORTED_FALLBACK_INTENT:"):
+            reason = generated_sql.split(":", 1)[1].strip()
+            raise ValueError(reason)
 
         # 4. Stage 3: Sandboxed Execution
         notify("EXECUTION", f"Executing query in sandboxed SQLite environment: {generated_sql}")
@@ -149,11 +152,38 @@ class VerifiableAnalysisPipeline:
             error_msg = execution_result.get("error")
             correction_prompt = f"Previous query failed with error: {error_msg}. Fix the query and ensure only valid SQLite syntax."
             generated_sql = self.coder.generate_sql(question, f"{plan_text}\n{correction_prompt}", schema_info, table_name)
+            if generated_sql.startswith("UNSUPPORTED_FALLBACK_INTENT:"):
+                raise ValueError(generated_sql.split(":", 1)[1].strip())
             execution_result = sandbox.execute(generated_sql)
 
-        # 5. Stage 4: Adversarial Audit
+        # 5. Stage 4: Adversarial Audit & Semantic Intent Validation
         notify("AUDITING", "Conducting adversarial verification on query and raw results...")
         audit_result = self.auditor.audit(question, generated_sql, execution_result, schema_info)
+
+        # Deterministic Intent Validation: Verifies whether the SQL query actually answers the question
+        intent_validation = QueryIntentValidator.validate_intent(
+            question=question,
+            sql=generated_sql,
+            schema_info=schema_info,
+            columns=execution_result.get("columns", []),
+            rows=execution_result.get("rows", [])
+        )
+
+        if not intent_validation["is_aligned"]:
+            audit_result["model_verdict"] = audit_result.get("verdict", "CONFIRMED")
+            audit_result["verdict"] = intent_validation["verdict"]  # "NEEDS_REVIEW" or "INTENT_MISMATCH"
+            audit_result["reasoning"] = (
+                f"🚨 QUESTION-TO-SQL INTENT MISMATCH DETECTED:\n"
+                f"- Issues: {'; '.join(intent_validation['issues'])}\n\n"
+                f"Auditor Evaluation:\n{audit_result.get('reasoning', '')}"
+            )
+        elif intent_validation.get("warnings"):
+            if audit_result.get("verdict") == "CONFIRMED":
+                audit_result["verdict"] = "NEEDS_REVIEW"
+            audit_result["reasoning"] = (
+                f"⚠️ INTENT ALIGNMENT NOTE: {'; '.join(intent_validation['warnings'])}\n\n"
+                f"Auditor Evaluation:\n{audit_result.get('reasoning', '')}"
+            )
 
         # 6. Stage 5: Statistical Engine (Hypothesis Testing & Anomaly Detection)
         notify("STATISTICS", "Computing empirical hypothesis tests, p-values, and anomaly dispersion...")
@@ -215,6 +245,15 @@ class VerifiableAnalysisPipeline:
             "chart_spec": chart_spec,
             "chart_suite": chart_suite,
             "fact_check": fact_check,
+            "intent_validation": intent_validation,
             "proof_certificate": proof_certificate,
+            "llm_runtime": {
+                "configured_provider": self.llm.configured_provider,
+                "active_provider": self.llm.provider,
+                "model": getattr(self.llm, "model", "unknown"),
+                "fallback_used": self.llm.fallback_used,
+                "fallback_reason": self.llm.fallback_reason,
+                "successful_llm_calls": self.llm.llm_calls_succeeded
+            },
             "trace": trace
         }

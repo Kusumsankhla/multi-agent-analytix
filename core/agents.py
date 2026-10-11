@@ -1,7 +1,7 @@
 import json
 import re
 from typing import Dict, Any, Optional
-from core.llm_client import LLMClient
+from core.llm_client import LLMClient, AnalyticQueryEngine
 
 class PlannerAgent:
     """
@@ -87,12 +87,16 @@ class AuditorVerifierAgent:
         system_prompt = (
             "You are the Adversarial Verification Agent (Auditor) in a verifiable data analysis system.\n"
             "You do NOT trust claims blindly. Your duty is to verify whether the SQL query and its raw output "
-            "faithfully, correctly, and rigorously answer the user question.\n"
+            "faithfully, correctly, and rigorously answer the exact user question.\n"
             "Evaluate:\n"
-            "1. Query correctness: Does the query measure the true metric asked?\n"
+            "1. Question-to-SQL intent alignment: Does the query actually answer the question asked?\n"
+            "   - If the user asks for average/mean of X, does SQL calculate AVG(X), or does it mistakenly group and COUNT(*)?\n"
+            "   - If the user asks about a specific condition (e.g., 'heart disease patients', 'fraud cases', 'age > 50'), does SQL filter with WHERE or condition in CASE? If the SQL ignores the condition, it DOES NOT answer the question.\n"
             "2. Aggregation safety: Did it avoid integer division? Are row groupings logical?\n"
             "3. Data plausibility: Are the resulting numbers mathematically sound?\n"
-            "You MUST conclude with either 'VERDICT: CONFIRMED' or 'VERDICT: FLAGGED' on its own line, followed by detailed bulleted audit findings."
+            "Only conclude VERDICT: CONFIRMED when the SQL demonstrably answers the exact question and the output supports it. "
+            "If the question-to-SQL match is not fully established or if conditions are missing, use VERDICT: NEEDS_REVIEW. "
+            "Finish with exactly one line: VERDICT: CONFIRMED, VERDICT: FLAGGED, or VERDICT: NEEDS_REVIEW."
         )
         user_prompt = (
             f"User Question: {question}\n"
@@ -103,14 +107,18 @@ class AuditorVerifierAgent:
         )
         audit_text = self.llm.generate(system_prompt, user_prompt, max_tokens=500)
         
-        verdict = "CONFIRMED"
-        if "VERDICT: FLAGGED" in audit_text.upper() or "FLAGGED" in audit_text.upper()[:50]:
+        upper_audit = audit_text.upper()
+        if "VERDICT: FLAGGED" in upper_audit:
             verdict = "FLAGGED"
+        elif "VERDICT: CONFIRMED" in upper_audit:
+            verdict = "CONFIRMED"
+        else:
+            verdict = "NEEDS_REVIEW"
 
         return {
             "verdict": verdict,
             "reasoning": audit_text,
-            "confidence_score": 95.0 if verdict == "CONFIRMED" else 40.0
+            "confidence_score": 95.0 if verdict == "CONFIRMED" else (40.0 if verdict == "FLAGGED" else 0.0)
         }
 
 
@@ -130,9 +138,10 @@ class SynthesisVisualizerAgent:
             "You are the Synthesis & Visualizer Agent in an autonomous data analysis framework.\n"
             "Your task: Formulate an executive business answer strictly grounded in the verified data.\n"
             "STRICT RULES:\n"
-            "1. State the exact numeric values from the result table. Never make up numbers not present in the data.\n"
-            "2. Provide 2-3 key analytical takeaways for business decision-makers.\n"
-            "3. Mention that all figures are verified against the ground-truth database rows."
+            "1. Start with a section: '### Direct Answer' and directly state the answer in natural language words using the exact numbers from the data.\n"
+            "2. State the exact numeric values from the result table (counts, percentages, averages, amounts). Never make up numbers not present in the data.\n"
+            "3. Do NOT output generic verification checklists like 'Query Correctness... Calculation Safety... Ground Truth Integrity...'. Describe what the data actually says about the question.\n"
+            "4. Provide 2-3 key analytical takeaways for business decision-makers."
         )
         user_prompt = (
             f"Question: {question}\n"
@@ -143,6 +152,28 @@ class SynthesisVisualizerAgent:
             "Write the verified executive synthesis:"
         )
         answer = self.llm.generate(system_prompt, user_prompt, max_tokens=700)
+        answer_without_code_fence = re.sub(
+            r"^```(?:sql|sqlite)?\s*|\s*```$",
+            "",
+            answer.strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+
+        is_generic_checklist = any(
+            phrase.lower() in answer.lower()
+            for phrase in ["query correctness", "calculation safety", "ground truth integrity"]
+        ) or answer.strip().startswith("VERDICT:")
+        is_sql_only = bool(re.match(r"^(?:SELECT|WITH)\b", answer_without_code_fence, re.IGNORECASE))
+        has_no_claims = not bool(re.search(r"\d+", answer)) if rows else False
+
+        if is_sql_only or is_generic_checklist or has_no_claims or getattr(self.llm, "fallback_used", False):
+            answer = AnalyticQueryEngine.synthesize_grounded_report(
+                question=question,
+                sql=sql,
+                columns=columns,
+                rows=rows,
+                auditor_verdict=auditor_feedback or "CONFIRMED"
+            )
 
         # Build chart specification
         chart_spec = self._build_chart_spec(columns, rows, question)
@@ -151,6 +182,33 @@ class SynthesisVisualizerAgent:
             "verified_answer": answer,
             "chart_spec": chart_spec
         }
+
+    @staticmethod
+    def _format_grounded_results(columns: list, rows: list) -> str:
+        """Show executed values as a readable answer if the model returns SQL instead."""
+        if not columns or not rows:
+            return (
+                "### Direct Answer\n"
+                "The executed query returned no rows, so there is no matching result to report."
+            )
+
+        def markdown_cell(value: Any) -> str:
+            return str(value).replace("|", r"\|").replace("\n", " ")
+
+        lines = [
+            "### Direct Answer",
+            f"The executed query returned {len(rows)} result(s). The database results are:",
+            "",
+            "| " + " | ".join(markdown_cell(column) for column in columns) + " |",
+            "| " + " | ".join("---" for _ in columns) + " |",
+        ]
+        for row in rows[:15]:
+            lines.append(
+                "| " + " | ".join(markdown_cell(value) for value in row) + " |"
+            )
+        if len(rows) > 15:
+            lines.append(f"\nShowing 15 of {len(rows)} returned results.")
+        return "\n".join(lines)
 
     def _build_chart_spec(self, columns: list, rows: list, question: str) -> Optional[Dict[str, Any]]:
         """Determines best Plotly visualization based on column types and dimensions."""
