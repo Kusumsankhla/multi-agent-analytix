@@ -20,7 +20,7 @@ from core.pipeline import VerifiableAnalysisPipeline
 
 from core.sandbox import SQLSandbox
 
-from core.verification_engine import DeterministicFactChecker
+from core.verification_engine import DeterministicFactChecker, VerificationBenchmark
 
 from core.proof_receipt import CryptographicProofGenerator
 
@@ -587,7 +587,7 @@ tab_analysis, tab_visuals, tab_stats, tab_simulator, tab_audit, tab_schema, tab_
 
     "🗄️ Schema Explorer",
 
-    "🧪 Stress Testing",
+    "🧪 Verification Benchmark",
 
     "📑 Academic Paper"
 
@@ -1308,7 +1308,7 @@ with tab_simulator:
                     plot_bgcolor="rgba(15, 23, 42, 0.55)",
                     transition=dict(duration=400, easing="cubic-in-out")
                 )
-                st.plotly_chart(fig_sim, use_container_width=True, config={"displayModeBar": True, "displaylogo": False, "responsive": True})
+                st.plotly_chart(fig_sim, use_container_width=True, config={"displayModeBar": True, "displaylogo": False, "responsive": True}, key="sim_projection_chart")
 
                 # Impact delta metrics
                 base_sum = float(df_sim[val_col].sum())
@@ -1417,7 +1417,7 @@ with tab_audit:
                     paper_bgcolor="rgba(11, 15, 25, 0.95)",
                     showlegend=False
                 )
-                st.plotly_chart(fig_pie, use_container_width=True, config={"displayModeBar": False, "responsive": True})
+                st.plotly_chart(fig_pie, use_container_width=True, config={"displayModeBar": False, "responsive": True}, key="grounding_pie_chart")
 
         # Question-to-SQL Intent Alignment Inspection
         iv = res.get("intent_validation")
@@ -1562,142 +1562,103 @@ with tab_schema:
 # TAB 7: BENCHMARK & ADVERSARIAL STRESS TEST
 # ==============================================================================
 
-def get_sample_adversarial_claims(d_name, d_cfg, execution=None):
-    """Generate realistic fabricated and grounded claims for the current domain."""
-    table = d_cfg.get("table", "records")
-    d_lower = d_name.lower()
-    
-    # Try to build a factually true claim from real execution rows
-    true_claim = ""
-    if execution and execution.get("rows") and execution.get("columns"):
-        rows = execution["rows"]
-        cols = execution["columns"]
-        row = rows[0]
-        str_part = None
-        num_part = None
-        for i, val in enumerate(row):
-            if isinstance(val, (int, float)) and num_part is None:
-                num_part = val
-                num_c = cols[i]
-            elif isinstance(val, str) and str_part is None and not any(ch.isdigit() for ch in val):
-                str_part = val
-                str_c = cols[i]
-        if str_part is not None and num_part is not None:
-            true_claim = f"In the verified database records, {str_c} '{str_part}' has an exact {num_c} of {num_part}."
-        elif num_part is not None:
-            true_claim = f"The ground-truth database records show a verified {num_c} of {num_part}."
-
-    if "retail" in d_lower:
-        fab = "The Technology category generated $10,000,000 in sales and achieved a 95% profit margin in 2025, making it the most profitable category."
-        gro = true_claim or "Office Supplies generated 393199.37 in total sales and 79922.17 in profit across 3 segments."
-    elif "heart" in d_lower:
-        fab = "Patients over age 80 exhibited an average resting blood pressure of 240 mm Hg with a 98% heart disease prevalence."
-        gro = true_claim or "In this clinical cohort, patient ages range from 28 to 77 years with resting blood pressure values up to 200 mm Hg."
-    elif "fraud" in d_lower:
-        fab = "Total fraudulent transactions amounted to $450,000,000 across 99,000 flagged accounts in 2024."
-        gro = true_claim or "The transaction monitoring dataset tracks verified financial records with transaction amounts audited in the SQLite sandbox."
-    elif "crypto" in d_lower:
-        fab = "Bitcoin surged to $250,000 with a 24-hour transaction volume exceeding $1.5 trillion on Binance."
-        gro = true_claim or "The live cryptocurrency feed streams 24-hour ticker price change percentages and volumes."
-    elif "hr" in d_lower:
-        fab = "The engineering department experienced an 85% attrition rate with average monthly income falling to $1,200."
-        gro = true_claim or "HR employee records track monthly income and attrition across company departments."
-    else:
-        fab = f"This dataset records 50,000,000 entries with a 99.9% conversion rate across all records in {table}."
-        gro = true_claim or f"Records in table '{table}' are validated directly against SQLite execution output."
-
-    return fab, gro
-
 with tab_stress:
-    st.subheader("Verification Benchmark & Adversarial Hallucination Stress Test")
-    st.caption("Demonstrate how the framework systematically catches and flags ungrounded claims.")
-    st.markdown("### 🥊 Adversarial Hallucination Injection Simulator")
-    st.markdown(
-        """
-        > 🧪 **Hallucination Detection Stress Test Bench**  
-        > This tool tests whether the Deterministic Fact-Checking Engine can catch **fabricated numbers and ungrounded claims** without trusting the LLM.  
-        >  
-        > 💡 *Notice: This is not an analysis query box. To ask questions and query your data, use the **🚀 Verifiable Analysis** tab. Use this simulator to audit whether a quantitative statement or report matches the underlying database records.*
-        """
-    )
+    st.subheader("Verification Benchmark: Does the Fact-Checker Catch Lies *and* Accept Truth?")
+    st.caption("Self-test of the deterministic (non-LLM) fact-checker on the active domain's real database rows.")
+
+    with st.expander("ℹ️ What is this tab and why does it matter?", expanded=False):
+        st.markdown(
+            """
+            The framework's central claim is that **numbers in an answer are checked against the database, not trusted from the LLM**.
+            This tab *proves that checker works* before you rely on its scores:
+
+            - **True claims** built from real rows must score **~100%** (no false alarms).
+            - **Fabricated or slightly-off claims** must score **0%** (hallucinations caught).
+            - **Half-true claims** must land **in between**.
+            - **Text with no numbers** must be reported as *not verifiable*, never as a fake 100%.
+
+            A checker that returns 0% for everything (or 100% for everything) would be useless, so this suite tests both directions.
+            The groundedness score of your *actual* analyses is shown in the **🚀 Verifiable Analysis** tab.
+            """
+        )
 
     active_result = st.session_state.last_analysis_result
     has_active_query = (active_result is not None and active_result.get("execution", {}).get("success"))
 
     if has_active_query:
         real_exec = active_result["execution"]
-        ref_context_text = f"Current query: **'{active_result['question']}'** on table `{domain_cfg['table']}` in `{domain_cfg['db']}`."
+        ref_context_text = f"Active query: **'{active_result['question']}'** on table `{domain_cfg['table']}` in `{domain_cfg['db']}`."
     else:
         sb_stress = SQLSandbox(domain_cfg["db"])
         tbl_stress = domain_cfg["table"]
         real_exec = sb_stress.execute(f'SELECT * FROM "{tbl_stress}" LIMIT 10;')
-        ref_context_text = f"Ground-truth table: `{tbl_stress}` in `{domain_cfg['db']}` (baseline rows)."
+        ref_context_text = f"Baseline rows from table `{tbl_stress}` in `{domain_cfg['db']}` (run an analysis to benchmark against its result instead)."
 
-    fab_sample, gro_sample = get_sample_adversarial_claims(domain_name, domain_cfg, real_exec)
-
-    st.markdown("**Quick Load Test Claims for Active Domain:**")
-    col_claim_b1, col_claim_b2 = st.columns(2)
-    with col_claim_b1:
-        if st.button("🚨 Load Fabricated Claim (Adversarial Hallucination)", use_container_width=True, key="btn_load_fab"):
-            st.session_state.adv_input_claim = fab_sample
-            st.rerun()
-    with col_claim_b2:
-        if st.button("✅ Load Grounded Claim (Fact-Checked)", use_container_width=True, key="btn_load_gro"):
-            st.session_state.adv_input_claim = gro_sample
-            st.rerun()
-
-    col_sim1, col_sim2 = st.columns([3, 2])
-    with col_sim1:
-        default_claim_val = st.session_state.get("adv_input_claim", fab_sample)
-        simulated_claim = st.text_area(
-            "Enter quantitative text or claim with potential hallucinations:",
-            value=default_claim_val,
-            height=110,
-            key="adv_claim_input_text"
-        )
-    with col_sim2:
-        st.markdown("**Ground-Truth Reference Context:**")
-        st.write(ref_context_text)
-        sim_run = st.button("🧪 Run Adversarial Detection Test", type="primary", use_container_width=True)
-
-    with st.expander("🔍 View Ground-Truth Reference Rows & SQL"):
+    st.markdown("**Ground-truth reference:** " + ref_context_text)
+    with st.expander("🔍 View ground-truth reference rows & SQL"):
         if has_active_query and "sql" in active_result:
             st.code(active_result["sql"], language="sql")
         if real_exec.get("rows"):
             st.dataframe(pd.DataFrame(real_exec["rows"], columns=real_exec["columns"]), use_container_width=True)
 
-    if sim_run and simulated_claim:
-        adversarial_audit = DeterministicFactChecker.verify_claims(simulated_claim, real_exec)
+    if st.button("🧪 Run Verification Benchmark Suite", type="primary", use_container_width=True, key="run_verif_benchmark"):
+        st.session_state.verif_benchmark = VerificationBenchmark.run(real_exec)
+        st.session_state.verif_benchmark_ctx = (domain_cfg["db"], domain_cfg["table"], active_result["question"] if has_active_query else None)
 
-        st.markdown("#### Verification Engine Verdict:")
-        adv_status = adversarial_audit["status"]
-        adv_score = adversarial_audit["groundedness_score"]
+    bench = st.session_state.get("verif_benchmark")
+    if bench and st.session_state.get("verif_benchmark_ctx") != (domain_cfg["db"], domain_cfg["table"], active_result["question"] if has_active_query else None):
+        st.info("The domain or active query changed. Re-run the suite to benchmark against the current ground truth.")
+        bench = None
 
-        if adv_status == "NO_CLAIMS_TO_VERIFY" or adv_score is None:
-            st.info(
-                "ℹ️ **No Numerical Claims Detected to Audit**\n\n"
-                "The text you submitted does not contain any numbers, figures, or percentages.\n\n"
-                "• The Stress Testing engine checks **quantitative claims** (e.g. '$10M sales' or '95% margin') against ground-truth database rows.\n"
-                "• If you intended to **ask a question** about your dataset, please switch to the **🚀 Verifiable Analysis** tab!"
-            )
-        elif adv_status == "HALLUCINATION_DETECTED":
-            st.error(f"🚨 **HALLUCINATION DETECTED!** Groundedness Score: **{adv_score}%**")
-            st.markdown(
-                f"The verification engine caught **{adversarial_audit.get('ungrounded_count', 0)} fabricated number(s)** "
-                "that have **no grounding** in the real database."
-            )
-        elif adv_status == "FULLY_GROUNDED":
-            st.success(f"✅ **FULLY GROUNDED!** Groundedness Score: **{adv_score}%**")
-            st.markdown(
-                f"All **{adversarial_audit.get('verified_count', 0)} quantitative figures** were confirmed "
-                "in the ground-truth database records."
-            )
+    if bench is not None:
+        if not bench["results"]:
+            st.warning("The ground-truth result has no numeric values to build test claims from. Run an analysis that returns numeric columns, then re-run.")
         else:
-            st.warning(f"⚠️ Status: **{adv_status}** | Groundedness Score: **{adv_score}%**")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Tests Passed", f"{bench['passed']} / {bench['total']}")
+            m2.metric("Overall Accuracy", f"{bench['accuracy']}%")
+            m3.metric("Fabrication Detection Rate", f"{bench['detection_rate']}%" if bench["detection_rate"] is not None else "N/A")
+            m4.metric("False-Alarm Rate (true claims flagged)", f"{bench['false_alarm_rate']}%" if bench["false_alarm_rate"] is not None else "N/A")
 
-        if adversarial_audit.get("claims_audit"):
-            st.markdown("**Claims Audit Breakdown:**")
-            st.dataframe(pd.DataFrame(adversarial_audit["claims_audit"]), use_container_width=True)
+            if bench["passed"] == bench["total"]:
+                st.success("✅ The fact-checker accepted every true claim, caught every fabrication, and handled partial and number-free text correctly.")
+            else:
+                st.error("🚨 Some benchmark cases failed. See the table below for which behaviour is wrong.")
+
+            summary_df = pd.DataFrame([
+                {
+                    "Test case": r["name"],
+                    "Test claim": r["claim"],
+                    "Expected": r["expected"],
+                    "Actual": r["actual"],
+                    "Groundedness": "n/a" if r["score"] is None else f"{r['score']}%",
+                    "Result": "✅ PASS" if r["passed"] else "❌ FAIL",
+                }
+                for r in bench["results"]
+            ])
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+            for idx, r in enumerate(bench["results"]):
+                if r["audit"].get("claims_audit"):
+                    with st.expander(f"Claims audit: {r['name']}", expanded=False):
+                        st.dataframe(pd.DataFrame(r["audit"]["claims_audit"]), use_container_width=True)
+
+    st.markdown("---")
+    with st.expander("✍️ Test your own claim (optional)", expanded=False):
+        st.caption("Paste any sentence containing numbers to see whether the checker finds them in the ground-truth rows above.")
+        custom_claim = st.text_area("Claim to verify:", value="", height=90, key="adv_claim_input_text")
+        if st.button("Verify custom claim", key="run_custom_claim") and custom_claim.strip():
+            audit = DeterministicFactChecker.verify_claims(custom_claim, real_exec)
+            if audit["status"] == "NO_CLAIMS_TO_VERIFY" or audit["groundedness_score"] is None:
+                st.info("No numerical claims were detected in that text, so there is nothing to verify.")
+            elif audit["status"] == "FULLY_GROUNDED":
+                st.success(f"✅ Fully grounded: {audit['groundedness_score']}%")
+            elif audit["status"] == "PARTIALLY_VERIFIED":
+                st.warning(f"⚠️ Partially verified: {audit['groundedness_score']}%")
+            else:
+                st.error(f"🚨 Hallucination detected: {audit['groundedness_score']}%")
+            if audit.get("claims_audit"):
+                st.dataframe(pd.DataFrame(audit["claims_audit"]), use_container_width=True)
 
 # ==============================================================================
 # TAB 8: ACADEMIC FRAMEWORK & METHODOLOGY

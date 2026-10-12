@@ -170,5 +170,19 @@ class TestVerificationEngine(unittest.TestCase):
         self.assertFalse(receipt["proves_answer_correctness"])
         self.assertTrue(len(receipt["certificate_hash"]) == 64)
 
+    def test_extractor_handles_plain_numbers_and_percentages(self):
+        toks = [c["raw_token"] for c in DeterministicFactChecker.extract_numbers_from_text(
+            "Sales were 393199.37 across 20000 units with a 99.9% margin and $1,234.50 revenue")]
+        self.assertEqual(toks, ["393199.37", "20000", "99.9%", "$1,234.50"])
+
+    def test_benchmark_suite_passes_on_real_rows(self):
+        from core.verification_engine import VerificationBenchmark
+        execution = {"success": True, "columns": ["category", "sum_sales", "sum_profit"],
+                     "rows": [("Furniture", 276506.68, 55503.67), ("Technology", 264489.32, 54699.15)]}
+        bench = VerificationBenchmark.run(execution)
+        self.assertEqual(bench["passed"], bench["total"])
+        self.assertEqual(bench["detection_rate"], 100.0)
+        self.assertEqual(bench["false_alarm_rate"], 0.0)
+
 if __name__ == "__main__":
     unittest.main()

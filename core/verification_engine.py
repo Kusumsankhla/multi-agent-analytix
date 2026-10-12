@@ -20,7 +20,9 @@ class DeterministicFactChecker:
         """
         results = []
         # Support suffixes like K, M, B (e.g. $45.2M, 950K)
-        pattern = r"(?:[\$€£])?\b\d{1,3}(?:,\d{3})*(?:\.\d+)?[%kKmMbB]?\b"
+        # Handles both comma-grouped (12,450.50) and plain (393199.37, 20000) numbers,
+        # keeps a trailing % attached, and only treats K/M/B as a suffix when it ends the token.
+        pattern = r"(?:[\$€£])?(?<![\w.,])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:%|[kKmMbB](?![A-Za-z]))?(?![\w])"
         
         matches = re.finditer(pattern, text)
         for m in matches:
@@ -185,6 +187,14 @@ class DeterministicFactChecker:
                     matched = True
                     best_match_val = truth
                     break
+
+            # Percent claims may be stored as plain numbers in non-"rate"-named columns
+            if not matched and is_pct:
+                for truth in truth_index["numbers"]:
+                    if math.isclose(val, truth, rel_tol=tolerance_pct / 100.0, abs_tol=0.02):
+                        matched = True
+                        best_match_val = truth
+                        break
 
             if matched:
                 verified_count += 1
@@ -404,3 +414,137 @@ class QueryIntentValidator:
             "summary": summary
         }
 
+
+
+class VerificationBenchmark:
+    """
+    Self-test for the DeterministicFactChecker.
+
+    Builds labelled test claims (some TRUE, some FALSE) straight from the real
+    ground-truth rows of the active domain, runs each through the fact-checker,
+    and compares the verdict with the expected one. A trustworthy checker must
+    pass true claims (high groundedness) AND reject false ones (low groundedness),
+    so a single always-fabricated claim (always 0%) is not a meaningful benchmark.
+    """
+
+    _FAKE_FACTORS = (7.31, 0.137, 53.9, 3.77, 0.021, 211.3)
+
+    @staticmethod
+    def _fmt(v: float) -> str:
+        return f"{int(v):,}" if float(v).is_integer() else f"{v:,.2f}"
+
+    @staticmethod
+    def _clean_name(name: str) -> str:
+        return re.sub(r"\d+", "", str(name)).replace("_", " ").strip() or "value"
+
+    @classmethod
+    def _is_known(cls, value: float, truth: Dict[str, Set[float]], tol_pct: float = 1.5) -> bool:
+        pool = truth["numbers"] | truth["rates"]
+        return any(math.isclose(value, t, rel_tol=tol_pct / 100.0, abs_tol=0.02) for t in pool)
+
+    @classmethod
+    def _fabricate(cls, real: float, truth: Dict[str, Set[float]]) -> float:
+        for f in cls._FAKE_FACTORS:
+            cand = round(real * f, 2) if real else round(f * 1000, 2)
+            if cand > 0 and not cls._is_known(cand, truth):
+                return cand
+        return 987654321.5
+
+    @classmethod
+    def build_test_cases(cls, execution: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not execution or not execution.get("success") or not execution.get("rows"):
+            return []
+        cols = execution.get("columns", [])
+        rows = execution["rows"]
+        truth = DeterministicFactChecker.index_ground_truth_values(execution)
+
+        # Pick a label column and up to two numeric columns (non-zero, not yet-ambiguous)
+        label_idx = next((i for i, v in enumerate(rows[0]) if isinstance(v, str) and not any(c.isdigit() for c in v)), None)
+        num_idx = [i for i, v in enumerate(rows[0]) if isinstance(v, (int, float)) and not isinstance(v, bool) and float(v) not in (0.0,)]
+        if not num_idx:
+            return []
+        i1 = num_idx[0]
+        i2 = num_idx[1] if len(num_idx) > 1 else None
+
+        row = rows[0]
+        subject = f"'{row[label_idx]}'" if label_idx is not None else "the first record"
+        n1, v1 = cls._clean_name(cols[i1]), float(row[i1])
+        fake1 = cls._fabricate(v1, truth)
+        near1 = round(v1 * 1.25, 2)
+        if cls._is_known(near1, truth):
+            near1 = round(v1 * 1.6, 2)
+
+        cases: List[Dict[str, Any]] = [
+            {
+                "name": "Exact true claim",
+                "kind": "grounded",
+                "claim": f"{subject} has a {n1} of {cls._fmt(v1)}.",
+                "expected": "FULLY_GROUNDED",
+            },
+            {
+                "name": "True claim, rounded to 0 decimals",
+                "kind": "grounded",
+                "claim": f"{subject} has a {n1} of roughly {cls._fmt(round(v1))}.",
+                "expected": "FULLY_GROUNDED",
+            },
+            {
+                "name": "Fabricated number",
+                "kind": "fabricated",
+                "claim": f"{subject} has a {n1} of {cls._fmt(fake1)}.",
+                "expected": "HALLUCINATION_DETECTED",
+            },
+            {
+                "name": "Near-miss (value inflated 25%)",
+                "kind": "fabricated",
+                "claim": f"{subject} has a {n1} of {cls._fmt(near1)}.",
+                "expected": "HALLUCINATION_DETECTED",
+            },
+            {
+                "name": "Mixed: one true + one false",
+                "kind": "mixed",
+                "claim": f"{subject} has a {n1} of {cls._fmt(v1)} and a total of {cls._fmt(cls._fabricate(v1 * 1.9, truth))} orders.",
+                "expected": "PARTIAL_SCORE (0-100%)",
+            },
+            {
+                "name": "Qualitative text (no numbers)",
+                "kind": "neutral",
+                "claim": f"{subject} is one of the leading entries in this result set.",
+                "expected": "NO_CLAIMS_TO_VERIFY",
+            },
+        ]
+        if i2 is not None:
+            n2, v2 = cls._clean_name(cols[i2]), float(row[i2])
+            cases.insert(2, {
+                "name": "Two true figures",
+                "kind": "grounded",
+                "claim": f"{subject} has a {n1} of {cls._fmt(v1)} and a {n2} of {cls._fmt(v2)}.",
+                "expected": "FULLY_GROUNDED",
+            })
+        return cases
+
+    @classmethod
+    def run(cls, execution: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        for case in cls.build_test_cases(execution):
+            audit = DeterministicFactChecker.verify_claims(case["claim"], execution)
+            actual = audit["status"]
+            score = audit["groundedness_score"]
+            if case["kind"] == "mixed":
+                # A half-true claim must be flagged as neither fully grounded nor fully fabricated
+                passed = score is not None and 0.0 < score < 100.0
+                actual = f"PARTIAL_SCORE ({score}%)" if passed else actual
+            else:
+                passed = actual == case["expected"]
+            results.append({**case, "actual": actual, "score": score, "passed": passed, "audit": audit})
+
+        fab = [r for r in results if r["kind"] == "fabricated"]
+        gro = [r for r in results if r["kind"] == "grounded"]
+        passed = sum(r["passed"] for r in results)
+        return {
+            "results": results,
+            "total": len(results),
+            "passed": passed,
+            "accuracy": round(100.0 * passed / len(results), 1) if results else None,
+            "detection_rate": round(100.0 * sum(r["passed"] for r in fab) / len(fab), 1) if fab else None,
+            "false_alarm_rate": round(100.0 * sum(not r["passed"] for r in gro) / len(gro), 1) if gro else None,
+        }
